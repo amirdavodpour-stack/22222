@@ -1,0 +1,294 @@
+name: HOPE - Auto Build APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+concurrency:
+  group: hope-apk-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  BUILD_PROFILE: pilot
+  CI_ZIP_BUILD: "true"
+  API_BASE_URL: https://staging.invalid/api/v1
+
+jobs:
+  build-apk:
+    name: Build HOPE APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install unzip
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y unzip
+
+      - name: Find HOPE ZIP
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ZIP_FILE="$(
+            find "$GITHUB_WORKSPACE" \
+              -maxdepth 2 \
+              -type f \
+              -name 'HOPE-3_8_0-REPAIRED-BUILD-READY.zip' \
+              -print \
+              | head -n 1
+          )"
+
+          if [ -z "$ZIP_FILE" ]; then
+            echo "::error::HOPE project ZIP was not found."
+            find "$GITHUB_WORKSPACE" -maxdepth 3 -type f -print | sort
+            exit 1
+          fi
+
+          echo "ZIP FOUND:"
+          echo "$ZIP_FILE"
+
+          echo "ZIP_FILE=$ZIP_FILE" >> "$GITHUB_ENV"
+
+      - name: Validate ZIP
+        run: |
+          set -euo pipefail
+
+          unzip -t "$ZIP_FILE"
+
+      - name: Extract HOPE project
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          rm -rf extracted
+          mkdir -p extracted
+
+          unzip -q "$ZIP_FILE" -d extracted
+
+          echo "Extracted project:"
+          find extracted -maxdepth 4 -type f -print | sort | head -n 400
+
+      - name: Detect Flutter project
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          PUBSPEC="$(
+            find extracted \
+              -type f \
+              -name 'pubspec.yaml' \
+              -print \
+              | head -n 1
+          )"
+
+          if [ -z "$PUBSPEC" ]; then
+            echo "::error::pubspec.yaml was not found."
+            exit 1
+          fi
+
+          PROJECT_ROOT="$(dirname "$PUBSPEC")"
+
+          if [ ! -d "$PROJECT_ROOT/lib" ]; then
+            echo "::error::lib directory not found."
+            exit 1
+          fi
+
+          if [ ! -d "$PROJECT_ROOT/android" ]; then
+            echo "::error::android directory not found."
+            exit 1
+          fi
+
+          echo "PROJECT_ROOT=$PROJECT_ROOT" >> "$GITHUB_ENV"
+
+          echo "Flutter project:"
+          echo "$PROJECT_ROOT"
+
+      - name: Setup Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: "3.47.0"
+          channel: stable
+          cache: true
+
+      - name: Flutter diagnostics
+        run: |
+          flutter --version
+          flutter doctor -v
+
+      - name: Verify project structure
+        working-directory: ${{ env.PROJECT_ROOT }}
+        run: |
+          set -euo pipefail
+
+          test -f pubspec.yaml
+          test -f android/app/build.gradle.kts
+          test -f tools/build_apk_release.sh
+          test -f tools/verify-pubspec-lock-fresh.sh
+
+          echo "Project structure OK."
+
+      - name: Get Flutter dependencies
+        working-directory: ${{ env.PROJECT_ROOT }}
+        run: |
+          flutter pub get
+
+      - name: Verify pubspec lock
+        working-directory: ${{ env.PROJECT_ROOT }}
+        env:
+          CI_ZIP_BUILD: "true"
+        run: |
+          set -euo pipefail
+
+          ./tools/verify-pubspec-lock-fresh.sh
+
+      - name: Flutter analyze
+        working-directory: ${{ env.PROJECT_ROOT }}
+        run: |
+          flutter analyze \
+            --no-fatal-infos \
+            --no-fatal-warnings
+
+      - name: Flutter tests
+        working-directory: ${{ env.PROJECT_ROOT }}
+        run: |
+          flutter test
+
+      - name: Prepare Android Gradle
+        working-directory: ${{ env.PROJECT_ROOT }}
+        run: |
+          chmod +x android/gradlew
+          chmod +x tools/build_apk_release.sh
+          chmod +x tools/android-release-contract.sh
+
+      - name: Run Android release contract
+        working-directory: ${{ env.PROJECT_ROOT }}
+        run: |
+          ./tools/android-release-contract.sh
+
+      - name: Build pilot release APK
+        working-directory: ${{ env.PROJECT_ROOT }}
+        env:
+          BUILD_PROFILE: pilot
+          CI: "true"
+          CI_ZIP_BUILD: "true"
+          API_BASE_URL: https://staging.invalid/api/v1
+        run: |
+          set -euo pipefail
+
+          ./tools/build_apk_release.sh
+
+      - name: Locate generated APK
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          APK="$(
+            find "$PROJECT_ROOT/build" \
+              -type f \
+              -name '*.apk' \
+              -print \
+              | sort \
+              | head -n 1
+          )"
+
+          if [ -z "$APK" ]; then
+            echo "::error::No APK was generated."
+            find "$PROJECT_ROOT/build" -type f -print | sort | head -n 300 || true
+            exit 1
+          fi
+
+          echo "APK FOUND:"
+          echo "$APK"
+
+          mkdir -p "$GITHUB_WORKSPACE/release"
+
+          cp "$APK" "$GITHUB_WORKSPACE/release/HOPE.apk"
+
+          echo "APK_PATH=$GITHUB_WORKSPACE/release/HOPE.apk" >> "$GITHUB_ENV"
+
+      - name: Verify APK artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test -f "$APK_PATH"
+
+          echo "APK size:"
+          ls -lh "$APK_PATH"
+
+          echo
+          echo "SHA256:"
+          sha256sum "$APK_PATH" | tee "$GITHUB_WORKSPACE/release/HOPE.apk.sha256"
+
+      - name: Generate build metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          {
+            echo "HOPE Android APK"
+            echo "=============================="
+            echo
+            echo "Repository: $GITHUB_REPOSITORY"
+            echo "Commit: $GITHUB_SHA"
+            echo "Branch: $GITHUB_REF_NAME"
+            echo "Build profile: $BUILD_PROFILE"
+            echo
+            echo "Flutter:"
+            flutter --version
+            echo
+            echo "APK:"
+            echo "$APK_PATH"
+            echo
+            echo "SHA256:"
+            sha256sum "$APK_PATH"
+          } > "$GITHUB_WORKSPACE/release/build-info.txt"
+
+          cat "$GITHUB_WORKSPACE/release/build-info.txt"
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: HOPE-APK
+          path: |
+            release/HOPE.apk
+            release/HOPE.apk.sha256
+            release/build-info.txt
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: hope-build-${{ github.run_number }}
+          name: HOPE APK Build ${{ github.run_number }}
+          generate_release_notes: true
+          body: |
+            Automated HOPE pilot APK build.
+
+            Build profile: pilot
+
+            This is a test/pilot build and is not production-signed.
+
+          files: |
+            release/HOPE.apk
+            release/HOPE.apk.sha256
+            release/build-info.txt
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
